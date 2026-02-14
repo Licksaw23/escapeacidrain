@@ -10,8 +10,7 @@ local TweenService = game:GetService("TweenService")
 
 -- Configuration
 local CONFIG = {
-    NUM_BASES = 6,
-    BASE_SPACING = 60,
+    NUM_BASES = 5,
     INCOME_TICK_RATE = 1,
     TOUCH_COOLDOWN = 0.5,
     
@@ -65,66 +64,35 @@ function BaseSystem.Init()
 end
 
 function BaseSystem.SetupBases()
-    local template = workspace:FindFirstChild("Base 5")
-    if not template then
-        warn("⚠️ Base 5 template not found in workspace!")
+    local basesFolder = workspace:FindFirstChild("Bases")
+    if not basesFolder then
+        warn("⚠️ No Bases folder found in workspace!")
         return
     end
     
-    local basesFolder = workspace:FindFirstChild("Bases")
-    if not basesFolder then
-        basesFolder = Instance.new("Folder")
-        basesFolder.Name = "Bases"
-        basesFolder.Parent = workspace
-    end
-    
-    for _, child in ipairs(basesFolder:GetChildren()) do
-        child:Destroy()
-    end
-    
-    local startX = -((CONFIG.NUM_BASES - 1) * CONFIG.BASE_SPACING) / 2
-    
-    for i = 1, CONFIG.NUM_BASES do
-        local base = template:Clone()
-        base.Name = "Base" .. i
-        
-        -- Start from far left, fill to the right
-        local position = Vector3.new(startX + (i - 1) * CONFIG.BASE_SPACING, 0, 50)
-        
-        -- Move entire base
-        -- Find a reference part to calculate offset (use Floor model's first BasePart)
-        local defaultFolder = base:FindFirstChild("Default")
-        local floorModel = defaultFolder and defaultFolder:FindFirstChild("Floor")
-        local refPart = floorModel and floorModel:FindFirstChildWhichIsA("BasePart")
-        
-        if refPart then
-            local offset = position - refPart.Position
-            for _, part in ipairs(base:GetDescendants()) do
-                if part:IsA("BasePart") then
-                    part.Position = part.Position + offset
-                end
-            end
+    -- Scan existing bases (manually placed)
+    local baseIndex = 1
+    for _, base in ipairs(basesFolder:GetChildren()) do
+        if base:IsA("Model") or base:IsA("Folder") then
+            bases[baseIndex] = {
+                id = baseIndex,
+                model = base,
+                owner = nil,
+                slots = {},
+                floors = 1,
+                claimedSlots = 0,
+                earnings = 0,
+                offlineEarnings = 0
+            }
+            
+            BaseSystem.SetupBaseSlots(baseIndex)
+            BaseSystem.SetupBaseInteractions(baseIndex)
+            
+            baseIndex = baseIndex + 1
         end
-        
-        base.Parent = basesFolder
-        
-        bases[i] = {
-            id = i,
-            model = base,
-            owner = nil,
-            slots = {},
-            floors = 1,
-            claimedSlots = 0,
-            earnings = 0,
-            offlineEarnings = 0
-        }
-        
-        BaseSystem.SetupBaseSlots(i)
-        BaseSystem.SetupBaseInteractions(i)
     end
     
-    -- Delete the template after cloning
-    template:Destroy()
+    print(string.format("📍 Found %d bases", baseIndex - 1))
 end
 
 function BaseSystem.SetupBaseSlots(baseId)
