@@ -88,6 +88,7 @@ function BaseSystem.SetupBases()
         local base = template:Clone()
         base.Name = "Base" .. i
         
+        -- Start from far left, fill to the right
         local position = Vector3.new(startX + (i - 1) * CONFIG.BASE_SPACING, 0, 50)
         
         -- Move entire base
@@ -121,6 +122,9 @@ function BaseSystem.SetupBases()
         BaseSystem.SetupBaseSlots(i)
         BaseSystem.SetupBaseInteractions(i)
     end
+    
+    -- Delete the template after cloning
+    template:Destroy()
 end
 
 function BaseSystem.SetupBaseSlots(baseId)
