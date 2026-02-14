@@ -1,0 +1,36 @@
+{
+  "name": "FeedTheBrainrots",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "$path": "ServerScripts"
+    },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "Shared": {
+        "$path": "Shared"
+      },
+      "Remotes": {
+        "$className": "Folder"
+      }
+    },
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "Systems": {
+        "$path": "Systems"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$path": "ClientScripts"
+      }
+    },
+    "StarterGui": {
+      "$className": "StarterGui",
+      "$path": "UI"
+    }
+  }
+}
