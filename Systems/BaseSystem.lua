@@ -91,9 +91,13 @@ function BaseSystem.SetupBases()
         local position = Vector3.new(startX + (i - 1) * CONFIG.BASE_SPACING, 0, 50)
         
         -- Move entire base
-        local primary = base:FindFirstChild("Default") and base.Default:FindFirstChild("Floor")
-        if primary then
-            local offset = position - primary.Position
+        -- Find a reference part to calculate offset (use Floor model's first BasePart)
+        local defaultFolder = base:FindFirstChild("Default")
+        local floorModel = defaultFolder and defaultFolder:FindFirstChild("Floor")
+        local refPart = floorModel and floorModel:FindFirstChildWhichIsA("BasePart")
+        
+        if refPart then
+            local offset = position - refPart.Position
             for _, part in ipairs(base:GetDescendants()) do
                 if part:IsA("BasePart") then
                     part.Position = part.Position + offset
