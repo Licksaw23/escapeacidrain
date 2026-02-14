@@ -141,7 +141,7 @@ function BaseSystem.SetupSlotInteractions(player, slotModel, slotId)
                 if clickingPlayer == player then
                     BaseSystem.OnSlotButtonClick(player, slotId)
                 end
-            end})
+            end)
             clickDetector.Parent = basePart
         end
     end
