@@ -1,26 +1,26 @@
 -- BaseSystem.lua
--- Manages tycoon bases using the Workspace.Bases structure
+-- Tycoon bases - cloned from template on server init, players assigned on join
+-- Uses Touched for interactions (walk into buttons to claim/upgrade/collect)
 
 local BaseSystem = {}
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
 -- Configuration
 local CONFIG = {
+    NUM_BASES = 6,
+    BASE_SPACING = 60,
     INCOME_TICK_RATE = 1,
-    CLAIM_COOLDOWN = 0.5,
+    TOUCH_COOLDOWN = 0.5,
     
-    -- Slot costs
     SLOT_COST_BASE = 100,
     SLOT_COST_MULTIPLIER = 1.15,
-    
-    -- Floor costs  
     FLOOR_COST_BASE = 500,
     FLOOR_COST_MULTIPLIER = 1.5,
     
-    -- Brainrot income per second by rarity
     INCOME_RATES = {
         Common = 1,
         Rare = 3,
@@ -30,9 +30,10 @@ local CONFIG = {
     }
 }
 
--- Player data
-local playerBases = {} -- [player] = {baseModel, slots = {}, floors = {}, earnings = 0}
-local availableBases = {} -- List of unclaimed base models
+-- State
+local bases = {} -- [baseId] = {model, owner, slots, data}
+local playerData = {} -- [player] = {baseId, earnings, etc}
+local touchDebounce = {}
 
 -- Events
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -41,211 +42,293 @@ BaseUpdateEvent.Name = "BaseUpdateEvent"
 BaseUpdateEvent.Parent = Remotes
 
 function BaseSystem.Init()
-    -- Find available bases
-    BaseSystem.ScanAvailableBases()
+    -- Clone and position bases on server start
+    BaseSystem.SetupBases()
     
-    -- Setup player joining
+    -- Handle players
     Players.PlayerAdded:Connect(BaseSystem.OnPlayerJoin)
     Players.PlayerRemoving:Connect(BaseSystem.OnPlayerLeave)
     
     -- Start income loop
     task.spawn(BaseSystem.IncomeLoop)
     
-    print("🏠 Base System initialized - Found " .. #availableBases .. " available bases")
+    print("🏠 Base System initialized - " .. CONFIG.NUM_BASES .. " bases ready")
 end
 
-function BaseSystem.ScanAvailableBases()
-    local basesFolder = workspace:FindFirstChild("Bases")
-    if not basesFolder then return end
-    
-    for _, base in ipairs(basesFolder:GetChildren()) do
-        if base:IsA("Model") or base:IsA("Folder") then
-            table.insert(availableBases, base)
-        end
-    end
-end
-
-function BaseSystem.OnPlayerJoin(player)
-    -- Assign next available base
-    if #availableBases == 0 then
-        warn("No available bases for " .. player.Name)
+function BaseSystem.SetupBases()
+    local template = workspace:FindFirstChild("Base 5")
+    if not template then
+        warn("⚠️ Base 5 template not found in workspace!")
         return
     end
     
-    local baseModel = table.remove(availableBases, 1)
-    
-    playerBases[player] = {
-        model = baseModel,
-        owner = player,
-        slots = {},
-        floors = {},
-        earnings = 0,
-        offlineEarnings = 0,
-        claimedSlots = 0,
-        claimedFloors = 1
-    }
-    
-    -- Setup the base structure
-    BaseSystem.SetupBaseSlots(player, baseModel)
-    BaseSystem.SetupBaseInteractions(player, baseModel)
-    
-    print(string.format("Assigned %s to %s", baseModel.Name, player.Name))
-end
-
-function BaseSystem.OnPlayerLeave(player)
-    local baseData = playerBases[player]
-    if baseData then
-        -- Return base to available pool
-        table.insert(availableBases, baseData.model)
-        playerBases[player] = nil
+    local basesFolder = workspace:FindFirstChild("Bases")
+    if not basesFolder then
+        basesFolder = Instance.new("Folder")
+        basesFolder.Name = "Bases"
+        basesFolder.Parent = workspace
     end
-end
-
-function BaseSystem.SetupBaseSlots(player, baseModel)
-    local baseData = playerBases[player]
-    if not baseData then return end
     
-    -- Find Slots folder
-    local slotsFolder = baseModel:FindFirstChild("Slots")
-    if not slotsFolder then return end
+    -- Clear existing bases
+    for _, child in ipairs(basesFolder:GetChildren()) do
+        child:Destroy()
+    end
     
-    -- Setup each slot
-    for _, slot in ipairs(slotsFolder:GetChildren()) do
-        if slot:IsA("Model") or slot:IsA("Folder") then
-            local slotId = tonumber(slot.Name)
-            if slotId then
-                baseData.slots[slotId] = {
-                    id = slotId,
-                    model = slot,
-                    claimed = false,
-                    brainrot = nil,
-                    upgraded = false
-                }
-                
-                -- Setup slot interactions
-                BaseSystem.SetupSlotInteractions(player, slot, slotId)
+    -- Position bases in a line
+    local startX = -((CONFIG.NUM_BASES - 1) * CONFIG.BASE_SPACING) / 2
+    
+    for i = 1, CONFIG.NUM_BASES do
+        local base = template:Clone()
+        base.Name = "Base" .. i
+        
+        -- Position base
+        local position = Vector3.new(startX + (i - 1) * CONFIG.BASE_SPACING, 0, 50)
+        
+        -- Move entire base model
+        local primary = base:FindFirstChild("Default") and base.Default:FindFirstChild("Floor")
+        if primary then
+            local offset = position - primary.Position
+            for _, part in ipairs(base:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.Position = part.Position + offset
+                end
             end
         end
+        
+        base.Parent = basesFolder
+        
+        -- Setup base data
+        bases[i] = {
+            id = i,
+            model = base,
+            owner = nil,
+            slots = {},
+            floors = 1,
+            claimedSlots = 0,
+            earnings = 0,
+            offlineEarnings = 0
+        }
+        
+        -- Setup slot data
+        BaseSystem.SetupBaseSlots(i)
+        
+        -- Setup touched interactions
+        BaseSystem.SetupBaseInteractions(i)
     end
 end
 
-function BaseSystem.SetupSlotInteractions(player, slotModel, slotId)
-    -- Find Button for claiming slot
-    local button = slotModel:FindFirstChild("Button")
+function BaseSystem.SetupBaseSlots(baseId)
+    local base = bases[baseId]
+    if not base then return end
+    
+    local slotsFolder = base.model:FindFirstChild("Slots")
+    if not slotsFolder then return end
+    
+    for _, slotModel in ipairs(slotsFolder:GetChildren()) do
+        local slotId = tonumber(slotModel.Name)
+        if slotId then
+            base.slots[slotId] = {
+                id = slotId,
+                model = slotModel,
+                claimed = false,
+                brainrot = nil,
+                upgraded = false
+            }
+        end
+    end
+end
+
+function BaseSystem.SetupBaseInteractions(baseId)
+    local base = bases[baseId]
+    if not base then return end
+    
+    -- Setup slot interactions (Button, Claim, Upgrade)
+    for slotId, slot in pairs(base.slots) do
+        BaseSystem.SetupSlotTouch(baseId, slotId)
+    end
+    
+    -- Setup floor purchase buttons
+    BaseSystem.SetupFloorTouches(baseId)
+    
+    -- Setup offline earnings claim
+    BaseSystem.SetupOfflineEarningsTouch(baseId)
+end
+
+function BaseSystem.SetupSlotTouch(baseId, slotId)
+    local base = bases[baseId]
+    local slot = base.slots[slotId]
+    if not slot then return end
+    
+    -- Button - claim slot (green part)
+    local button = slot.model:FindFirstChild("Button")
     if button then
-        local basePart = button:FindFirstChild("Base") or button:FindFirstChildWhichIsA("BasePart")
-        if basePart then
-            local clickDetector = Instance.new("ClickDetector")
-            clickDetector.MaxActivationDistance = 15
-            clickDetector.MouseClick:Connect(function(clickingPlayer)
-                if clickingPlayer == player then
-                    BaseSystem.OnSlotButtonClick(player, slotId)
-                end
+        local buttonPart = button:FindFirstChild("Bottom") or button:FindFirstChild("Base")
+        if buttonPart and buttonPart:IsA("BasePart") then
+            buttonPart.Touched:Connect(function(hit)
+                BaseSystem.HandleTouch(hit, baseId, function(player)
+                    BaseSystem.OnSlotButtonTouched(player, baseId, slotId)
+                end)
             end)
-            clickDetector.Parent = basePart
         end
     end
     
-    -- Find Claim for collecting earnings
-    local claim = slotModel:FindFirstChild("Claim")
+    -- Claim - collect earnings
+    local claim = slot.model:FindFirstChild("Claim")
     if claim then
         local claimPart = claim:FindFirstChildWhichIsA("BasePart")
         if claimPart then
-            local clickDetector = Instance.new("ClickDetector")
-            clickDetector.MaxActivationDistance = 15
-            clickDetector.MouseClick:Connect(function(clickingPlayer)
-                if clickingPlayer == player then
-                    BaseSystem.OnClaimEarnings(player, slotId)
-                end
-            end})
-            clickDetector.Parent = claimPart
+            claimPart.Touched:Connect(function(hit)
+                BaseSystem.HandleTouch(hit, baseId, function(player)
+                    BaseSystem.OnClaimTouched(player, baseId, slotId)
+                end)
+            end)
         end
     end
     
-    -- Find Upgrade button
-    local upgrade = slotModel:FindFirstChild("Upgrade")
+    -- Upgrade button
+    local upgrade = slot.model:FindFirstChild("Upgrade")
     if upgrade then
         local upgradeUi = upgrade:FindFirstChild("UpgradeUi")
         if upgradeUi then
             local upgradeButton = upgradeUi:FindFirstChild("UpgradeButton")
             if upgradeButton then
-                -- Make the button clickable
                 local clickPart = upgradeButton:FindFirstChild("1") or upgradeButton:FindFirstChildWhichIsA("BasePart")
                 if clickPart then
-                    local clickDetector = Instance.new("ClickDetector")
-                    clickDetector.MaxActivationDistance = 10
-                    clickDetector.MouseClick:Connect(function(clickingPlayer)
-                        if clickingPlayer == player then
-                            BaseSystem.OnUpgradeSlot(player, slotId)
-                        end
-                    end})
-                    clickDetector.Parent = clickPart
+                    clickPart.Touched:Connect(function(hit)
+                        BaseSystem.HandleTouch(hit, baseId, function(player)
+                            BaseSystem.OnUpgradeTouched(player, baseId, slotId)
+                        end)
+                    end)
                 end
             end
         end
     end
 end
 
-function BaseSystem.SetupBaseInteractions(player, baseModel)
-    -- Setup floor purchase buttons
-    local floorsFolder = baseModel:FindFirstChild("Floors")
-    if floorsFolder then
-        for _, floor in ipairs(floorsFolder:GetChildren()) do
-            local floorNum = tonumber(floor.Name)
-            if floorNum and floorNum > 1 then -- Floor 1 is default
-                local clickDetector = Instance.new("ClickDetector")
-                clickDetector.MaxActivationDistance = 15
-                clickDetector.MouseClick:Connect(function(clickingPlayer)
-                    if clickingPlayer == player then
-                        BaseSystem.OnPurchaseFloor(player, floorNum)
-                    end
-                end})
-                clickDetector.Parent = floor
+function BaseSystem.SetupFloorTouches(baseId)
+    local base = bases[baseId]
+    if not base then return end
+    
+    -- Floor purchase buttons (PurchaseFloor2, PurchaseFloor3, etc)
+    for _, child in ipairs(base.model:GetChildren()) do
+        if child.Name:match("^PurchaseFloor%d+") then
+            local floorNum = tonumber(child.Name:match("%d+"))
+            if floorNum then
+                child.Touched:Connect(function(hit)
+                    BaseSystem.HandleTouch(hit, baseId, function(player)
+                        BaseSystem.OnPurchaseFloor(player, baseId, floorNum)
+                    end)
+                end)
             end
         end
     end
+end
+
+function BaseSystem.SetupOfflineEarningsTouch(baseId)
+    local base = bases[baseId]
+    if not base then return end
     
-    -- Setup offline earnings claim
-    local offlineEarnings = baseModel:FindFirstChild("Offline Earnings")
-    if offlineEarnings and offlineEarnings:IsA("BasePart") then
-        local clickDetector = Instance.new("ClickDetector")
-        clickDetector.MaxActivationDistance = 15
-        clickDetector.MouseClick:Connect(function(clickingPlayer)
-            if clickingPlayer == player then
-                BaseSystem.OnClaimOfflineEarnings(player)
-            end
-        end})
-        clickDetector.Parent = offlineEarnings
+    local offlinePart = base.model:FindFirstChild("Offline Earnings")
+    if offlinePart and offlinePart:IsA("BasePart") then
+        offlinePart.Touched:Connect(function(hit)
+            BaseSystem.HandleTouch(hit, baseId, function(player)
+                BaseSystem.OnClaimOfflineEarnings(player, baseId)
+            end)
+        end)
     end
 end
 
-function BaseSystem.OnSlotButtonClick(player, slotId)
-    local baseData = playerBases[player]
-    if not baseData then return end
+function BaseSystem.HandleTouch(hit, baseId, callback)
+    local character = hit.Parent
+    if not character then return end
     
-    local slot = baseData.slots[slotId]
-    if not slot then return end
+    local player = Players:GetPlayerFromCharacter(character)
+    if not player then return end
     
-    if slot.claimed then
-        -- Already claimed - show message
-        return
+    local base = bases[baseId]
+    if not base then return end
+    
+    -- Check if player owns this base
+    if base.owner ~= player then return end
+    
+    -- Debounce
+    local key = player.UserId .. "_" .. baseId
+    if touchDebounce[key] then return end
+    
+    touchDebounce[key] = true
+    callback(player)
+    task.wait(CONFIG.TOUCH_COOLDOWN)
+    touchDebounce[key] = nil
+end
+
+function BaseSystem.OnPlayerJoin(player)
+    -- Find first unclaimed base
+    for baseId, base in ipairs(bases) do
+        if not base.owner then
+            BaseSystem.AssignBaseToPlayer(player, baseId)
+            return
+        end
     end
     
-    -- Calculate cost
-    local cost = math.floor(CONFIG.SLOT_COST_BASE * (CONFIG.SLOT_COST_MULTIPLIER ^ (baseData.claimedSlots)))
+    warn("No available bases for " .. player.Name)
+end
+
+function BaseSystem.OnPlayerLeave(player)
+    local data = playerData[player]
+    if data and data.baseId then
+        local base = bases[data.baseId]
+        if base then
+            base.owner = nil
+            -- Save data would go here
+        end
+    end
+    playerData[player] = nil
+end
+
+function BaseSystem.AssignBaseToPlayer(player, baseId)
+    local base = bases[baseId]
+    if not base then return end
+    
+    base.owner = player
+    
+    playerData[player] = {
+        baseId = baseId,
+        earnings = base.earnings,
+        offlineEarnings = base.offlineEarnings,
+        inventory = {brainrots = {}, capacity = 3}
+    }
+    
+    -- Update client
+    BaseUpdateEvent:FireClient(player, {
+        action = "init",
+        baseId = baseId,
+        slots = base.slots,
+        floors = base.floors
+    })
+    
+    print(string.format("Assigned Base %d to %s", baseId, player.Name))
+end
+
+function BaseSystem.OnSlotButtonTouched(player, baseId, slotId)
+    local base = bases[baseId]
+    local slot = base.slots[slotId]
+    if not slot then return end
+    
+    if slot.claimed then return end
+    
+    local cost = math.floor(CONFIG.SLOT_COST_BASE * (CONFIG.SLOT_COST_MULTIPLIER ^ base.claimedSlots))
     
     -- TODO: Check player money
-    -- For now, auto-claim
     
     slot.claimed = true
-    baseData.claimedSlots = baseData.claimedSlots + 1
+    base.claimedSlots = base.claimedSlots + 1
     
-    -- Visual feedback - change button color
+    -- Visual feedback
     local button = slot.model:FindFirstChild("Button")
     if button then
-        local basePart = button:FindFirstChild("Base")
-        if basePart and basePart:IsA("BasePart") then
-            basePart.Color = Color3.fromRGB(0, 200, 0) -- Green for claimed
+        local buttonPart = button:FindFirstChild("Bottom") or button:FindFirstChild("Base")
+        if buttonPart and buttonPart:IsA("BasePart") then
+            buttonPart.Color = Color3.fromRGB(0, 200, 0)
         end
     end
     
@@ -254,31 +337,166 @@ function BaseSystem.OnSlotButtonClick(player, slotId)
         slotId = slotId,
         cost = cost
     })
-    
-    print(string.format("%s claimed slot %d for %d", player.Name, slotId, cost))
 end
 
+function BaseSystem.OnClaimTouched(player, baseId, slotId)
+    local base = bases[baseId]
+    local slot = base.slots[slotId]
+    if not slot or not slot.brainrot then return end
+    
+    local rarity = slot.brainrot.rarity
+    local rate = CONFIG.INCOME_RATES[rarity] or 1
+    if slot.upgraded then rate = rate * 2 end
+    
+    local earnings = rate * 60 -- Last minute
+    base.earnings = base.earnings + earnings
+    
+    -- Particle effect
+    local claim = slot.model:FindFirstChild("Claim")
+    if claim then
+        local emitter = claim:FindFirstChildOfClass("ParticleEmitter")
+        if emitter then emitter:Emit(20) end
+    end
+    
+    BaseUpdateEvent:FireClient(player, {
+        action = "earningsClaimed",
+        slotId = slotId,
+        amount = earnings
+    })
+end
+
+function BaseSystem.OnUpgradeTouched(player, baseId, slotId)
+    local base = bases[baseId]
+    local slot = base.slots[slotId]
+    if not slot or not slot.brainrot then return end
+    if slot.upgraded then return end
+    
+    local cost = CONFIG.SLOT_COST_BASE * 2
+    -- TODO: Check money
+    
+    slot.upgraded = true
+    
+    BaseUpdateEvent:FireClient(player, {
+        action = "slotUpgraded",
+        slotId = slotId
+    })
+end
+
+function BaseSystem.OnPurchaseFloor(player, baseId, floorNum)
+    local base = bases[baseId]
+    if base.floors >= floorNum then return end
+    if base.floors + 1 ~= floorNum then return end
+    
+    local cost = math.floor(CONFIG.FLOOR_COST_BASE * (CONFIG.FLOOR_COST_MULTIPLIER ^ (floorNum - 2)))
+    -- TODO: Check money
+    
+    base.floors = floorNum
+    
+    -- Make floor visible
+    local floorsFolder = base.model:FindFirstChild("Floors")
+    if floorsFolder then
+        local floor = floorsFolder:FindFirstChild(tostring(floorNum))
+        if floor then
+            for _, part in ipairs(floor:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.Transparency = 0
+                end
+            end
+        end
+    end
+    
+    BaseUpdateEvent:FireClient(player, {
+        action = "floorPurchased",
+        floor = floorNum,
+        cost = cost
+    })
+end
+
+function BaseSystem.OnClaimOfflineEarnings(player, baseId)
+    local base = bases[baseId]
+    local amount = base.offlineEarnings
+    if amount <= 0 then return end
+    
+    base.earnings = base.earnings + amount
+    base.offlineEarnings = 0
+    
+    BaseUpdateEvent:FireClient(player, {
+        action = "offlineEarningsClaimed",
+        amount = amount
+    })
+end
+
+function BaseSystem.IncomeLoop()
+    while true do
+        task.wait(CONFIG.INCOME_TICK_RATE)
+        
+        for _, base in ipairs(bases) do
+            if base.owner then
+                local totalIncome = 0
+                
+                for _, slot in pairs(base.slots) do
+                    if slot.claimed and slot.brainrot then
+                        local rarity = slot.brainrot.rarity
+                        local rate = CONFIG.INCOME_RATES[rarity] or 1
+                        if slot.upgraded then rate = rate * 2 end
+                        totalIncome = totalIncome + rate
+                    end
+                end
+                
+                if totalIncome > 0 then
+                    base.offlineEarnings = base.offlineEarnings + totalIncome
+                    BaseSystem.UpdateEarningsLabels(base)
+                end
+            end
+        end
+    end
+end
+
+function BaseSystem.UpdateEarningsLabels(base)
+    for _, slot in pairs(base.slots) do
+        if slot.claimed and slot.brainrot then
+            local claim = slot.model:FindFirstChild("Claim")
+            if claim then
+                local label = claim:FindFirstChild("EarningsLabel")
+                if label then
+                    local billboard = label:FindFirstChildOfClass("BillboardGui")
+                    if billboard then
+                        local textLabel = billboard:FindFirstChildOfClass("TextLabel")
+                        if textLabel then
+                            textLabel.Text = "$" .. math.floor(base.offlineEarnings)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- API for other systems
 function BaseSystem.PlaceBrainrotInSlot(player, slotId, brainrotData)
-    local baseData = playerBases[player]
-    if not baseData then return false end
+    local data = playerData[player]
+    if not data then return false end
     
-    local slot = baseData.slots[slotId]
+    local base = bases[data.baseId]
+    if not base then return false end
+    
+    local slot = base.slots[slotId]
     if not slot or not slot.claimed then return false end
-    if slot.brainrot then return false end -- Already has brainrot
+    if slot.brainrot then return false end
     
-    -- Place brainrot
     slot.brainrot = brainrotData
     
-    -- Create visual in Primary
+    -- Create visual
     local primary = slot.model:FindFirstChild("Primary")
-    if primary then
-        local modelTemplate = brainrotData.modelTemplate
-        if modelTemplate then
-            local cloned = modelTemplate:Clone()
+    if primary and brainrotData.modelTemplate then
+        local cloned = brainrotData.modelTemplate:Clone()
+        if cloned:FindFirstChild("HumanoidRootPart") then
             cloned:SetPrimaryPartCFrame(primary.CFrame)
-            cloned.Parent = primary
-            slot.visual = cloned
+        else
+            cloned:PivotTo(primary.CFrame)
         end
+        cloned.Parent = primary
+        slot.visual = cloned
     end
     
     BaseUpdateEvent:FireClient(player, {
@@ -290,184 +508,12 @@ function BaseSystem.PlaceBrainrotInSlot(player, slotId, brainrotData)
     return true
 end
 
-function BaseSystem.OnClaimEarnings(player, slotId)
-    local baseData = playerBases[player]
-    if not baseData then return end
-    
-    local slot = baseData.slots[slotId]
-    if not slot or not slot.brainrot then return end
-    
-    -- Calculate earnings for this slot
-    local rarity = slot.brainrot.rarity
-    local incomeRate = CONFIG.INCOME_RATES[rarity] or 1
-    local slotEarnings = incomeRate * CONFIG.INCOME_TICK_RATE * 60 -- Last minute of earnings
-    
-    -- Add to player
-    baseData.earnings = baseData.earnings + slotEarnings
-    
-    -- Particle effect
-    local claim = slot.model:FindFirstChild("Claim")
-    if claim then
-        local particleEmitter = claim:FindFirstChildOfClass("ParticleEmitter")
-        if particleEmitter then
-            particleEmitter:Emit(20)
-        end
-    end
-    
-    BaseUpdateEvent:FireClient(player, {
-        action = "earningsClaimed",
-        slotId = slotId,
-        amount = slotEarnings,
-        total = baseData.earnings
-    })
-end
-
-function BaseSystem.OnUpgradeSlot(player, slotId)
-    local baseData = playerBases[player]
-    if not baseData then return end
-    
-    local slot = baseData.slots[slotId]
-    if not slot or not slot.brainrot then return end
-    if slot.upgraded then return end
-    
-    -- Calculate upgrade cost (2x base slot cost)
-    local upgradeCost = math.floor(CONFIG.SLOT_COST_BASE * 2)
-    
-    -- TODO: Check player money
-    
-    slot.upgraded = true
-    
-    -- Boost income
-    local rarity = slot.brainrot.rarity
-    CONFIG.INCOME_RATES[rarity] = (CONFIG.INCOME_RATES[rarity] or 1) * 2
-    
-    BaseUpdateEvent:FireClient(player, {
-        action = "slotUpgraded",
-        slotId = slotId
-    })
-    
-    print(string.format("%s upgraded slot %d", player.Name, slotId))
-end
-
-function BaseSystem.OnPurchaseFloor(player, floorNum)
-    local baseData = playerBases[player]
-    if not baseData then return end
-    
-    if baseData.claimedFloors >= floorNum then
-        return -- Already have this floor
-    end
-    
-    if baseData.claimedFloors + 1 ~= floorNum then
-        return -- Must buy in order
-    end
-    
-    local cost = math.floor(CONFIG.FLOOR_COST_BASE * (CONFIG.FLOOR_COST_MULTIPLIER ^ (floorNum - 2)))
-    
-    -- TODO: Check player money
-    
-    baseData.claimedFloors = floorNum
-    
-    -- Make floor visible
-    local floorsFolder = baseData.model:FindFirstChild("Floors")
-    if floorsFolder then
-        local floor = floorsFolder:FindFirstChild(tostring(floorNum))
-        if floor then
-            floor.Transparency = 0
-        end
-    end
-    
-    BaseUpdateEvent:FireClient(player, {
-        action = "floorPurchased",
-        floor = floorNum,
-        cost = cost
-    })
-    
-    print(string.format("%s purchased floor %d for %d", player.Name, floorNum, cost))
-end
-
-function BaseSystem.OnClaimOfflineEarnings(player)
-    local baseData = playerBases[player]
-    if not baseData then return end
-    
-    local amount = baseData.offlineEarnings
-    if amount <= 0 then return end
-    
-    baseData.earnings = baseData.earnings + amount
-    baseData.offlineEarnings = 0
-    
-    BaseUpdateEvent:FireClient(player, {
-        action = "offlineEarningsClaimed",
-        amount = amount,
-        total = baseData.earnings
-    })
-end
-
-function BaseSystem.IncomeLoop()
-    while true do
-        task.wait(CONFIG.INCOME_TICK_RATE)
-        
-        for player, baseData in pairs(playerBases) do
-            local totalIncome = 0
-            
-            -- Calculate income from all slots
-            for _, slot in pairs(baseData.slots) do
-                if slot.claimed and slot.brainrot then
-                    local rarity = slot.brainrot.rarity
-                    local rate = CONFIG.INCOME_RATES[rarity] or 1
-                    if slot.upgraded then
-                        rate = rate * 2
-                    end
-                    totalIncome = totalIncome + rate
-                end
-            end
-            
-            -- Add to offline earnings (accumulates over time)
-            if totalIncome > 0 then
-                baseData.offlineEarnings = baseData.offlineEarnings + totalIncome
-                
-                -- Update earnings label
-                BaseSystem.UpdateEarningsLabel(baseData)
-            end
-        end
-    end
-end
-
-function BaseSystem.UpdateEarningsLabel(baseData)
-    -- Update all slot earnings labels
-    for _, slot in pairs(baseData.slots) do
-        if slot.claimed and slot.brainrot then
-            local claim = slot.model:FindFirstChild("Claim")
-            if claim then
-                local earningsLabel = claim:FindFirstChild("EarningsLabel")
-                if earningsLabel then
-                    local billboard = earningsLabel:FindFirstChildOfClass("BillboardGui")
-                    if billboard then
-                        local amountLabel = billboard:FindFirstChild("Amount")
-                        if amountLabel and amountLabel:IsA("TextLabel") then
-                            amountLabel.Text = "$" .. math.floor(baseData.offlineEarnings)
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
--- API for other systems
 function BaseSystem.GetPlayerBase(player)
-    return playerBases[player]
-end
-
-function BaseSystem.GetPlayerEarnings(player)
-    local baseData = playerBases[player]
-    return baseData and baseData.earnings or 0
-end
-
-function BaseSystem.AddPlayerEarnings(player, amount)
-    local baseData = playerBases[player]
-    if baseData then
-        baseData.earnings = baseData.earnings + amount
+    local data = playerData[player]
+    if data then
+        return bases[data.baseId]
     end
+    return nil
 end
 
 return BaseSystem

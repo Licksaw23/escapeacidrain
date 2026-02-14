@@ -1,5 +1,6 @@
 -- CollectionSystem.lua
 -- Spawns brainrots from ReplicatedStorage into rarity zones
+-- Uses Touched for collection (walk into brainrots to collect)
 
 local CollectionSystem = {}
 
@@ -12,8 +13,8 @@ local CONFIG = {
     MAX_SPAWNED = 50,
     SPAWN_INTERVAL = 8,
     DESPAWN_TIME = 180,
+    COLLECTION_COOLDOWN = 0.5,
     
-    -- Spawn counts per cycle
     SPAWN_BATCH = {
         min = 3,
         max = 6
@@ -23,6 +24,7 @@ local CONFIG = {
 -- State
 local spawnedBrainrots = {}
 local playerInventory = {}
+local collectionDebounce = {}
 
 -- Events
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -31,15 +33,12 @@ InventoryUpdateEvent.Name = "InventoryUpdateEvent"
 InventoryUpdateEvent.Parent = Remotes
 
 function CollectionSystem.Init()
-    -- Wait for zones to exist
     local zones = CollectionSystem.GetRarityZones()
-    if not zones or #zones == 0 then
+    if #zones == 0 then
         warn("⚠️ No rarity zones found! Create parts named Common, Rare, Legendary, Mythic, Secret in workspace")
     end
     
-    -- Start spawn cycle
     task.spawn(CollectionSystem.SpawnCycle)
-    
     print("🧠 Collection System initialized")
 end
 
@@ -50,11 +49,7 @@ function CollectionSystem.GetRarityZones()
     for _, name in ipairs(rarityNames) do
         local zone = workspace:FindFirstChild(name)
         if zone and zone:IsA("BasePart") then
-            table.insert(zones, {
-                name = name,
-                part = zone,
-                rarity = name
-            })
+            table.insert(zones, {name = name, part = zone, rarity = name})
         end
     end
     
@@ -66,19 +61,13 @@ function CollectionSystem.GetBrainrotModels()
         and ReplicatedStorage.Shared:FindFirstChild("Models")
         and ReplicatedStorage.Shared.Models:FindFirstChild("Brainrots")
     
-    if not modelsFolder then
-        return {}
-    end
+    if not modelsFolder then return {} end
     
     local models = {}
     for _, model in ipairs(modelsFolder:GetChildren()) do
         if model:IsA("Model") then
             local rarity = model:GetAttribute("Rarity") or "Common"
-            table.insert(models, {
-                model = model,
-                name = model.Name,
-                rarity = rarity
-            })
+            table.insert(models, {model = model, name = model.Name, rarity = rarity})
         end
     end
     
@@ -118,11 +107,9 @@ function CollectionSystem.SpawnRandomBrainrot()
         return
     end
     
-    -- Pick random model
     local modelData = models[math.random(1, #models)]
     local targetRarity = modelData.rarity
     
-    -- Find matching zone
     local targetZone = nil
     for _, zone in ipairs(zones) do
         if zone.rarity == targetRarity then
@@ -131,7 +118,6 @@ function CollectionSystem.SpawnRandomBrainrot()
         end
     end
     
-    -- Fallback to random zone if no match
     if not targetZone then
         targetZone = zones[math.random(1, #zones)]
     end
@@ -147,46 +133,36 @@ function CollectionSystem.SpawnBrainrotInZone(modelData, zone)
         brainrotsFolder.Parent = workspace
     end
     
-    -- Clone the model
     local clonedModel = modelData.model:Clone()
     clonedModel.Name = modelData.name
     
-    -- Random position within zone bounds
     local zonePart = zone.part
     local size = zonePart.Size
     local cframe = zonePart.CFrame
     
-    -- Generate random position inside the part
     local randomX = (math.random() - 0.5) * size.X * 0.8
     local randomZ = (math.random() - 0.5) * size.Z * 0.8
     local position = cframe.Position + Vector3.new(randomX, size.Y/2 + 2, randomZ)
     
-    -- Set position
     local primaryPart = clonedModel:FindFirstChild("HumanoidRootPart") or clonedModel:FindFirstChildWhichIsA("BasePart")
     if primaryPart then
         clonedModel:PivotTo(CFrame.new(position))
     end
     
-    -- Add click detector for collection
-    local clickPart = primaryPart or clonedModel:FindFirstChildWhichIsA("BasePart")
-    if clickPart then
-        local clickDetector = Instance.new("ClickDetector")
-        clickDetector.MaxActivationDistance = 20
-        clickDetector.MouseClick:Connect(function(player)
-            CollectionSystem.OnBrainrotClicked(player, clonedModel, modelData)
-        end)
-        clickDetector.Parent = clickPart
-        
-        -- Highlight when player gets close
-        CollectionSystem.SetupProximityHighlight(clonedModel, clickPart)
+    -- Setup Touched for collection on ALL parts of the model
+    for _, part in ipairs(clonedModel:GetDescendants()) do
+        if part:IsA("BasePart") then
+            CollectionSystem.SetupCollectionTouch(part, clonedModel, modelData)
+        end
     end
+    
+    -- Name tag above brainrot
+    CollectionSystem.CreateNameTag(clonedModel, modelData.name)
     
     clonedModel.Parent = brainrotsFolder
     
-    -- Play idle animation if available
     CollectionSystem.PlayIdleAnimation(clonedModel)
     
-    -- Track spawned brainrot
     table.insert(spawnedBrainrots, {
         model = clonedModel,
         data = modelData,
@@ -194,73 +170,36 @@ function CollectionSystem.SpawnBrainrotInZone(modelData, zone)
     })
 end
 
-function CollectionSystem.PlayIdleAnimation(model)
-    local humanoid = model:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return end
-    
-    -- Look for Idle animation
-    local torso = model:FindFirstChild("Torso") or model:FindFirstChild("HumanoidRootPart")
-    if torso then
-        local idle = torso:FindFirstChild("Idle")
-        if idle and idle:IsA("Animation") then
-            humanoid:LoadAnimation(idle):Play()
-        end
-    end
-    
-    -- Also check AnimSaves folder
-    local animSaves = model:FindFirstChild("AnimSaves")
-    if animSaves then
-        for _, anim in ipairs(animSaves:GetChildren()) do
-            if anim:IsA("Animation") and anim.Name:lower():find("idle") then
-                local track = humanoid:LoadAnimation(anim)
-                track:Play()
-                break
-            end
-        end
-    end
+function CollectionSystem.SetupCollectionTouch(part, model, modelData)
+    part.Touched:Connect(function(hit)
+        local character = hit.Parent
+        if not character then return end
+        
+        local player = Players:GetPlayerFromCharacter(character)
+        if not player then return end
+        
+        -- Debounce per player
+        local key = player.UserId .. "_" .. model:GetFullName()
+        if collectionDebounce[key] then return end
+        
+        collectionDebounce[key] = true
+        
+        -- Try to collect
+        local collected = CollectionSystem.TryCollectBrainrot(player, model, modelData)
+        
+        task.wait(CONFIG.COLLECTION_COOLDOWN)
+        collectionDebounce[key] = nil
+    end)
 end
 
-function CollectionSystem.SetupProximityHighlight(model, part)
-    -- Add BillboardGui for name
-    local billboard = Instance.new("BillboardGui")
-    billboard.Size = UDim2.new(0, 120, 0, 30)
-    billboard.StudsOffset = Vector3.new(0, 4, 0)
-    billboard.AlwaysOnTop = false
-    billboard.MaxDistance = 50
-    
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.Text = model.Name
-    label.TextColor3 = Color3.new(1, 1, 1)
-    label.TextStrokeTransparency = 0
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 14
-    label.Parent = billboard
-    
-    billboard.Parent = part
-    
-    -- Highlight effect when nearby
-    local highlight = Instance.new("Highlight")
-    highlight.Name = "CollectionHighlight"
-    highlight.FillColor = Color3.fromRGB(0, 255, 100)
-    highlight.OutlineColor = Color3.new(1, 1, 1)
-    highlight.FillTransparency = 0.8
-    highlight.OutlineTransparency = 0
-    highlight.Enabled = false
-    highlight.Parent = model
-end
-
-function CollectionSystem.OnBrainrotClicked(player, model, modelData)
-    -- Check inventory
+function CollectionSystem.TryCollectBrainrot(player, model, modelData)
     if not playerInventory[player] then
         playerInventory[player] = {brainrots = {}, capacity = 3}
     end
     
     local inventory = playerInventory[player]
     if #inventory.brainrots >= inventory.capacity then
-        -- Inventory full - notify player
-        return
+        return false -- Inventory full
     end
     
     -- Add to inventory
@@ -285,6 +224,54 @@ function CollectionSystem.OnBrainrotClicked(player, model, modelData)
     InventoryUpdateEvent:FireClient(player, inventory)
     
     print(string.format("%s collected %s (%s)", player.Name, modelData.name, modelData.rarity))
+    return true
+end
+
+function CollectionSystem.CreateNameTag(model, name)
+    local primaryPart = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+    if not primaryPart then return end
+    
+    local billboard = Instance.new("BillboardGui")
+    billboard.Size = UDim2.new(0, 120, 0, 30)
+    billboard.StudsOffset = Vector3.new(0, 4, 0)
+    billboard.AlwaysOnTop = false
+    billboard.MaxDistance = 50
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = name
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextStrokeTransparency = 0
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 14
+    label.Parent = billboard
+    
+    billboard.Parent = primaryPart
+end
+
+function CollectionSystem.PlayIdleAnimation(model)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    
+    local torso = model:FindFirstChild("Torso") or model:FindFirstChild("HumanoidRootPart")
+    if torso then
+        local idle = torso:FindFirstChild("Idle")
+        if idle and idle:IsA("Animation") then
+            humanoid:LoadAnimation(idle):Play()
+        end
+    end
+    
+    local animSaves = model:FindFirstChild("AnimSaves")
+    if animSaves then
+        for _, anim in ipairs(animSaves:GetChildren()) do
+            if anim:IsA("Animation") and anim.Name:lower():find("idle") then
+                local track = humanoid:LoadAnimation(anim)
+                track:Play()
+                break
+            end
+        end
+    end
 end
 
 function CollectionSystem.CleanupOldBrainrots()
@@ -300,6 +287,7 @@ function CollectionSystem.CleanupOldBrainrots()
     end
 end
 
+-- Inventory API
 function CollectionSystem.GetPlayerInventory(player)
     if not playerInventory[player] then
         playerInventory[player] = {brainrots = {}, capacity = 3}
