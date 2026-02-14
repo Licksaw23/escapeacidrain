@@ -1,246 +1,238 @@
 -- CollectionSystem.lua
--- Handles brainrot spawning, collection, and rarity zones
+-- Spawns brainrots from ReplicatedStorage into rarity zones
 
 local CollectionSystem = {}
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local ServerStorage = game:GetService("ServerStorage")
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
-
--- Load brainrot data
-local BrainrotsData = require(ReplicatedStorage.Shared.Modules.Libraries.BrainrotsData)
 
 -- Configuration
 local CONFIG = {
-    SPAWN_INTERVAL = 10, -- Seconds between spawn cycles
-    MAX_SPAWNED = 50,    -- Max brainrots in world at once
-    DESPAWN_TIME = 120,  -- Seconds before despawn
+    MAX_SPAWNED = 50,
+    SPAWN_INTERVAL = 8,
+    DESPAWN_TIME = 180,
     
-    -- Zone distances from spawn
-    ZONES = {
-        {name = "Common", distance = 0, rarities = {"Common"}, color = Color3.fromRGB(169, 169, 169)},
-        {name = "Uncommon", distance = 50, rarities = {"Uncommon"}, color = Color3.fromRGB(0, 255, 0)},
-        {name = "Rare", distance = 100, rarities = {"Rare"}, color = Color3.fromRGB(0, 100, 255)},
-        {name = "Epic", distance = 200, rarities = {"Epic"}, color = Color3.fromRGB(150, 0, 255)},
-        {name = "Legendary", distance = 350, rarities = {"Legendary"}, color = Color3.fromRGB(255, 215, 0)},
-        {name = "Mythical", distance = 500, rarities = {"Mythical"}, color = Color3.fromRGB(255, 0, 100)}
+    -- Spawn counts per cycle
+    SPAWN_BATCH = {
+        min = 3,
+        max = 6
     }
-}
-
--- Rarity weights
-local RARITY_WEIGHTS = {
-    Common = 50,
-    Uncommon = 30,
-    Rare = 15,
-    Epic = 4,
-    Legendary = 0.9,
-    Mythical = 0.1
 }
 
 -- State
 local spawnedBrainrots = {}
-local playerInventory = {} -- [player] = {brainrots = {}, capacity = 3}
+local playerInventory = {}
 
 -- Events
 local Remotes = ReplicatedStorage:WaitForChild("Remotes")
-local CollectBrainrotEvent = Instance.new("RemoteEvent")
-CollectBrainrotEvent.Name = "CollectBrainrotEvent"
-CollectBrainrotEvent.Parent = Remotes
-
 local InventoryUpdateEvent = Instance.new("RemoteEvent")
 InventoryUpdateEvent.Name = "InventoryUpdateEvent"
 InventoryUpdateEvent.Parent = Remotes
 
 function CollectionSystem.Init()
-    -- Start spawn cycle
-    spawn(CollectionSystem.SpawnCycle)
+    -- Wait for zones to exist
+    local zones = CollectionSystem.GetRarityZones()
+    if not zones or #zones == 0 then
+        warn("⚠️ No rarity zones found! Create parts named Common, Rare, Legendary, Mythic, Secret in workspace")
+    end
     
-    -- Setup collection remote
-    CollectBrainrotEvent.OnServerEvent:Connect(CollectionSystem.OnCollectRequest)
+    -- Start spawn cycle
+    task.spawn(CollectionSystem.SpawnCycle)
     
     print("🧠 Collection System initialized")
 end
 
+function CollectionSystem.GetRarityZones()
+    local zones = {}
+    local rarityNames = {"Common", "Rare", "Legendary", "Mythic", "Secret"}
+    
+    for _, name in ipairs(rarityNames) do
+        local zone = workspace:FindFirstChild(name)
+        if zone and zone:IsA("BasePart") then
+            table.insert(zones, {
+                name = name,
+                part = zone,
+                rarity = name
+            })
+        end
+    end
+    
+    return zones
+end
+
+function CollectionSystem.GetBrainrotModels()
+    local modelsFolder = ReplicatedStorage:FindFirstChild("Shared")
+        and ReplicatedStorage.Shared:FindFirstChild("Models")
+        and ReplicatedStorage.Shared.Models:FindFirstChild("Brainrots")
+    
+    if not modelsFolder then
+        return {}
+    end
+    
+    local models = {}
+    for _, model in ipairs(modelsFolder:GetChildren()) do
+        if model:IsA("Model") then
+            local rarity = model:GetAttribute("Rarity") or "Common"
+            table.insert(models, {
+                model = model,
+                name = model.Name,
+                rarity = rarity
+            })
+        end
+    end
+    
+    return models
+end
+
 function CollectionSystem.SpawnCycle()
     while true do
-        wait(CONFIG.SPAWN_INTERVAL)
+        task.wait(CONFIG.SPAWN_INTERVAL)
         
-        if #spawnedBrainrots < CONFIG.MAX_SPAWNED then
-            CollectionSystem.SpawnBrainrotBatch()
+        local currentCount = #spawnedBrainrots
+        if currentCount < CONFIG.MAX_SPAWNED then
+            local toSpawn = math.random(CONFIG.SPAWN_BATCH.min, CONFIG.SPAWN_BATCH.max)
+            toSpawn = math.min(toSpawn, CONFIG.MAX_SPAWNED - currentCount)
+            
+            for i = 1, toSpawn do
+                CollectionSystem.SpawnRandomBrainrot()
+                task.wait(0.3)
+            end
         end
         
-        -- Clean up old brainrots
         CollectionSystem.CleanupOldBrainrots()
     end
 end
 
-function CollectionSystem.SpawnBrainrotBatch()
-    local batchSize = math.min(5, CONFIG.MAX_SPAWNED - #spawnedBrainrots)
-    
-    for i = 1, batchSize do
-        CollectionSystem.SpawnRandomBrainrot()
-        wait(0.5) -- Stagger spawns
-    end
-end
-
 function CollectionSystem.SpawnRandomBrainrot()
-    -- Pick random spawn point based on zones
-    local spawnPoints = workspace:FindFirstChild("BrainrotSpawnPoints")
-    if not spawnPoints or #spawnPoints:GetChildren() == 0 then
-        -- Fallback: spawn near center with random offset
-        CollectionSystem.SpawnAtPosition(Vector3.new(0, 5, 0))
+    local zones = CollectionSystem.GetRarityZones()
+    local models = CollectionSystem.GetBrainrotModels()
+    
+    if #models == 0 then
+        warn("⚠️ No brainrot models in ReplicatedStorage.Shared.Models.Brainrots")
         return
     end
     
-    -- Pick random spawn point
-    local spawnPointsList = spawnPoints:GetChildren()
-    local spawnPoint = spawnPointsList[math.random(1, #spawnPointsList)]
+    if #zones == 0 then
+        warn("⚠️ No rarity zones found in workspace")
+        return
+    end
     
-    CollectionSystem.SpawnAtPosition(spawnPoint.Position)
+    -- Pick random model
+    local modelData = models[math.random(1, #models)]
+    local targetRarity = modelData.rarity
+    
+    -- Find matching zone
+    local targetZone = nil
+    for _, zone in ipairs(zones) do
+        if zone.rarity == targetRarity then
+            targetZone = zone
+            break
+        end
+    end
+    
+    -- Fallback to random zone if no match
+    if not targetZone then
+        targetZone = zones[math.random(1, #zones)]
+    end
+    
+    CollectionSystem.SpawnBrainrotInZone(modelData, targetZone)
 end
 
-function CollectionSystem.SpawnAtPosition(position)
-    -- Determine rarity based on zone distance from spawn
-    local distanceFromSpawn = (position - Vector3.new(0, 0, 0)).Magnitude
-    local rarity = CollectionSystem.GetRarityForDistance(distanceFromSpawn)
+function CollectionSystem.SpawnBrainrotInZone(modelData, zone)
+    local brainrotsFolder = workspace:FindFirstChild("Brainrots")
+    if not brainrotsFolder then
+        brainrotsFolder = Instance.new("Folder")
+        brainrotsFolder.Name = "Brainrots"
+        brainrotsFolder.Parent = workspace
+    end
     
-    -- Pick random brainrot of that rarity
-    local brainrotName = CollectionSystem.GetRandomBrainrotByRarity(rarity)
-    if not brainrotName then return end
+    -- Clone the model
+    local clonedModel = modelData.model:Clone()
+    clonedModel.Name = modelData.name
     
-    local brainrotData = BrainrotsData[brainrotName]
+    -- Random position within zone bounds
+    local zonePart = zone.part
+    local size = zonePart.Size
+    local cframe = zonePart.CFrame
     
-    -- Create brainrot model
-    local brainrot = CollectionSystem.CreateBrainrotModel(brainrotName, rarity, position)
+    -- Generate random position inside the part
+    local randomX = (math.random() - 0.5) * size.X * 0.8
+    local randomZ = (math.random() - 0.5) * size.Z * 0.8
+    local position = cframe.Position + Vector3.new(randomX, size.Y/2 + 2, randomZ)
+    
+    -- Set position
+    local primaryPart = clonedModel:FindFirstChild("HumanoidRootPart") or clonedModel:FindFirstChildWhichIsA("BasePart")
+    if primaryPart then
+        clonedModel:PivotTo(CFrame.new(position))
+    end
+    
+    -- Add click detector for collection
+    local clickPart = primaryPart or clonedModel:FindFirstChildWhichIsA("BasePart")
+    if clickPart then
+        local clickDetector = Instance.new("ClickDetector")
+        clickDetector.MaxActivationDistance = 20
+        clickDetector.MouseClick:Connect(function(player)
+            CollectionSystem.OnBrainrotClicked(player, clonedModel, modelData)
+        end)
+        clickDetector.Parent = clickPart
+        
+        -- Highlight when player gets close
+        CollectionSystem.SetupProximityHighlight(clonedModel, clickPart)
+    end
+    
+    clonedModel.Parent = brainrotsFolder
+    
+    -- Play idle animation if available
+    CollectionSystem.PlayIdleAnimation(clonedModel)
     
     -- Track spawned brainrot
     table.insert(spawnedBrainrots, {
-        model = brainrot,
-        name = brainrotName,
-        rarity = rarity,
-        data = brainrotData,
+        model = clonedModel,
+        data = modelData,
         spawnTime = tick()
     })
 end
 
-function CollectionSystem.GetRarityForDistance(distance)
-    -- Further from spawn = higher chance of rare
-    local rand = math.random(1, 1000) / 10
+function CollectionSystem.PlayIdleAnimation(model)
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
     
-    -- Adjust weights based on distance
-    local adjustedWeights = {}
-    for rarity, weight in pairs(RARITY_WEIGHTS) do
-        adjustedWeights[rarity] = weight
-    end
-    
-    -- Boost rare chances for far zones
-    if distance > 400 then
-        adjustedWeights.Mythical = adjustedWeights.Mythical * 5
-        adjustedWeights.Legendary = adjustedWeights.Legendary * 3
-    elseif distance > 250 then
-        adjustedWeights.Legendary = adjustedWeights.Legendary * 2
-        adjustedWeights.Epic = adjustedWeights.Epic * 1.5
-    elseif distance > 150 then
-        adjustedWeights.Epic = adjustedWeights.Epic * 1.3
-        adjustedWeights.Rare = adjustedWeights.Rare * 1.2
-    end
-    
-    -- Weighted random selection
-    local totalWeight = 0
-    for _, weight in pairs(adjustedWeights) do
-        totalWeight = totalWeight + weight
-    end
-    
-    local roll = math.random() * totalWeight
-    local cumulative = 0
-    
-    for rarity, weight in pairs(adjustedWeights) do
-        cumulative = cumulative + weight
-        if roll <= cumulative then
-            return rarity
+    -- Look for Idle animation
+    local torso = model:FindFirstChild("Torso") or model:FindFirstChild("HumanoidRootPart")
+    if torso then
+        local idle = torso:FindFirstChild("Idle")
+        if idle and idle:IsA("Animation") then
+            humanoid:LoadAnimation(idle):Play()
         end
     end
     
-    return "Common"
-end
-
-function CollectionSystem.GetRandomBrainrotByRarity(rarity)
-    -- Filter brainrots by rarity (for now, all are treated similarly)
-    -- In a real implementation, you'd tag brainrots with rarities
-    local brainrotNames = {}
-    for name, _ in pairs(BrainrotsData) do
-        table.insert(brainrotNames, name)
+    -- Also check AnimSaves folder
+    local animSaves = model:FindFirstChild("AnimSaves")
+    if animSaves then
+        for _, anim in ipairs(animSaves:GetChildren()) do
+            if anim:IsA("Animation") and anim.Name:lower():find("idle") then
+                local track = humanoid:LoadAnimation(anim)
+                track:Play()
+                break
+            end
+        end
     end
-    
-    if #brainrotNames == 0 then return nil end
-    return brainrotNames[math.random(1, #brainrotNames)]
 end
 
-function CollectionSystem.CreateBrainrotModel(name, rarity, position)
-    -- Create placeholder model (replace with actual assets later)
-    local model = Instance.new("Model")
-    model.Name = name
-    
-    local part = Instance.new("Part")
-    part.Name = "BrainrotPart"
-    part.Size = Vector3.new(3, 3, 3)
-    part.Position = position + Vector3.new(0, 3, 0)
-    part.Anchored = true
-    part.CanCollide = false
-    part.Shape = Enum.PartType.Ball
-    
-    -- Color based on rarity
-    local colors = {
-        Common = Color3.fromRGB(169, 169, 169),
-        Uncommon = Color3.fromRGB(0, 255, 0),
-        Rare = Color3.fromRGB(0, 100, 255),
-        Epic = Color3.fromRGB(150, 0, 255),
-        Legendary = Color3.fromRGB(255, 215, 0),
-        Mythical = Color3.fromRGB(255, 0, 100)
-    }
-    part.Color = colors[rarity] or colors.Common
-    part.Material = Enum.Material.Neon
-    
-    -- Add glow
-    local light = Instance.new("PointLight")
-    light.Color = part.Color
-    light.Brightness = 2
-    light.Range = 8
-    light.Parent = part
-    
-    -- Floating animation
-    local floatTween = TweenService:Create(part, TweenInfo.new(2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
-        Position = position + Vector3.new(0, 4, 0)
-    })
-    floatTween:Play()
-    
-    -- Spin animation
-    local spinTween = TweenService:Create(part, TweenInfo.new(4, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1), {
-        Orientation = Vector3.new(0, 360, 0)
-    })
-    spinTween:Play()
-    
-    -- Click detector for collection
-    local clickDetector = Instance.new("ClickDetector")
-    clickDetector.MaxActivationDistance = 15
-    clickDetector.MouseClick:Connect(function(player)
-        CollectionSystem.CollectBrainrot(player, model)
-    end)
-    clickDetector.Parent = part
-    
-    -- Billboard GUI for name
+function CollectionSystem.SetupProximityHighlight(model, part)
+    -- Add BillboardGui for name
     local billboard = Instance.new("BillboardGui")
-    billboard.Size = UDim2.new(0, 100, 0, 40)
-    billboard.StudsOffset = Vector3.new(0, 3, 0)
+    billboard.Size = UDim2.new(0, 120, 0, 30)
+    billboard.StudsOffset = Vector3.new(0, 4, 0)
     billboard.AlwaysOnTop = false
+    billboard.MaxDistance = 50
     
     local label = Instance.new("TextLabel")
     label.Size = UDim2.new(1, 0, 1, 0)
     label.BackgroundTransparency = 1
-    label.Text = name
-    label.TextColor3 = part.Color
+    label.Text = model.Name
+    label.TextColor3 = Color3.new(1, 1, 1)
     label.TextStrokeTransparency = 0
     label.Font = Enum.Font.GothamBold
     label.TextSize = 14
@@ -248,57 +240,51 @@ function CollectionSystem.CreateBrainrotModel(name, rarity, position)
     
     billboard.Parent = part
     
-    part.Parent = model
-    model.Parent = workspace.Brainrots
-    
-    return model
+    -- Highlight effect when nearby
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "CollectionHighlight"
+    highlight.FillColor = Color3.fromRGB(0, 255, 100)
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.FillTransparency = 0.8
+    highlight.OutlineTransparency = 0
+    highlight.Enabled = false
+    highlight.Parent = model
 end
 
-function CollectionSystem.OnCollectRequest(player, brainrotModel)
-    CollectionSystem.CollectBrainrot(player, brainrotModel)
-end
-
-function CollectionSystem.CollectBrainrot(player, brainrotModel)
-    -- Check player inventory capacity
+function CollectionSystem.OnBrainrotClicked(player, model, modelData)
+    -- Check inventory
     if not playerInventory[player] then
         playerInventory[player] = {brainrots = {}, capacity = 3}
     end
     
     local inventory = playerInventory[player]
     if #inventory.brainrots >= inventory.capacity then
-        -- Inventory full
+        -- Inventory full - notify player
         return
     end
     
-    -- Find brainrot data
-    local brainrotData = nil
-    local index = nil
+    -- Add to inventory
+    table.insert(inventory.brainrots, {
+        name = modelData.name,
+        rarity = modelData.rarity,
+        modelTemplate = modelData.model
+    })
+    
+    -- Remove from world
+    model:Destroy()
+    
+    -- Remove from tracking
     for i, data in ipairs(spawnedBrainrots) do
-        if data.model == brainrotModel then
-            brainrotData = data
-            index = i
+        if data.model == model then
+            table.remove(spawnedBrainrots, i)
             break
         end
     end
     
-    if not brainrotData then return end
-    
-    -- Add to inventory
-    table.insert(inventory.brainrots, {
-        name = brainrotData.name,
-        rarity = brainrotData.rarity,
-        data = brainrotData.data
-    })
-    
-    -- Remove from world
-    brainrotModel:Destroy()
-    table.remove(spawnedBrainrots, index)
-    
     -- Update client
     InventoryUpdateEvent:FireClient(player, inventory)
     
-    -- Track analytics
-    -- AnalyticsService.TrackEvent("BrainrotCollected", {rarity = brainrotData.rarity})
+    print(string.format("%s collected %s (%s)", player.Name, modelData.name, modelData.rarity))
 end
 
 function CollectionSystem.CleanupOldBrainrots()
@@ -326,6 +312,15 @@ function CollectionSystem.ClearPlayerInventory(player)
         playerInventory[player].brainrots = {}
         InventoryUpdateEvent:FireClient(player, playerInventory[player])
     end
+end
+
+function CollectionSystem.RemoveFromInventory(player, index)
+    if playerInventory[player] and playerInventory[player].brainrots[index] then
+        table.remove(playerInventory[player].brainrots, index)
+        InventoryUpdateEvent:FireClient(player, playerInventory[player])
+        return true
+    end
+    return false
 end
 
 return CollectionSystem
